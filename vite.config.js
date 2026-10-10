@@ -4,5 +4,14 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   base: process.env.NODE_ENV === 'production' ? '/Filza-Lead/' : '/',
   plugins: [react()],
+  server: {
+    proxy: {
+      '/api/google-places': {
+        target: 'https://maps.googleapis.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/google-places/, ''),
+      },
+    },
+  },
 });
 
