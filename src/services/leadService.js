@@ -514,7 +514,9 @@ export async function searchLeads({
   targetCount = 30,
   radius = 15000,
   filterType = 'all',
-  googleApiKey = ''
+  googleApiKey = '',
+  forceRefresh = false,
+  refreshSeed = 0
 }) {
   const catObj = categoriesList.find(c => c.id === category) || categoriesList[0];
   const targetCity = (city && city !== 'All Cities' && city !== 'All Cities / Metro Center')
@@ -525,7 +527,7 @@ export async function searchLeads({
 
   // Check full search cache first — if we already searched this exact combo, return instantly
   const fullSearchCacheKey = getCacheKey('search', { country, region, city, category, targetCount, filterType, hasGoogleKey: !!googleApiKey });
-  const cachedSearch = getFromCache(fullSearchCacheKey);
+  const cachedSearch = forceRefresh ? null : getFromCache(fullSearchCacheKey);
   if (cachedSearch) {
     console.log('Lead search: serving full result from cache');
     return cachedSearch;
@@ -607,8 +609,13 @@ export async function searchLeads({
   // Query Nominatim SEQUENTIALLY (not parallel!) to respect their 1 req/sec rate limit
   const searchTerms = catObj.searchKeywords || ['hospital', 'hotel', 'restaurant', 'bank', 'school', 'shop', 'office'];
 
-  // Limit to 4 search terms to keep total request time reasonable
-  const termsToSearch = searchTerms.slice(0, 4);
+  // Refresh rotates through more public directory terms while keeping requests modest.
+  const termWindowSize = forceRefresh ? 7 : 4;
+  const rotationStart = forceRefresh && searchTerms.length
+    ? refreshSeed % searchTerms.length
+    : 0;
+  const termsToSearch = [...searchTerms.slice(rotationStart), ...searchTerms.slice(0, rotationStart)]
+    .slice(0, termWindowSize);
 
   try {
     for (const term of termsToSearch) {
@@ -618,7 +625,7 @@ export async function searchLeads({
 
       // Check per-term cache
       const termCacheKey = getCacheKey('nominatim', { query });
-      let items = getFromCache(termCacheKey);
+      let items = forceRefresh ? null : getFromCache(termCacheKey);
 
       if (!items) {
         const url = `https://nominatim.openstreetmap.org/search?format=json&limit=8&addressdetails=1&extratags=1&q=${encodeURIComponent(query)}`;
@@ -649,7 +656,7 @@ export async function searchLeads({
         const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${cleanName} ${placeCity} ${country}`)}`;
 
         addLead({
-          id: `osm-${item.place_id || Math.random()}`,
+          id: `osm-${item.place_id || `${cleanName}-${placeCity}`}`,
           name: cleanName,
           category: normalizeCategoryName(item.type || item.queryTerm, catObj),
           phone: rawPhone, // Empty string if not in public tags - NEVER generate random numbers!
@@ -661,9 +668,9 @@ export async function searchLeads({
           country: country,
           lat: parseFloat(item.lat),
           lon: parseFloat(item.lon),
-          rating: +(4.2 + (Math.random() * 0.6)).toFixed(1),
-          reviews: Math.floor(35 + Math.random() * 450),
-          status: 'Google Maps & OSM Verified Place',
+          rating: 0,
+          reviews: 0,
+          status: 'Public Directory Verified Place',
           googleMapsUrl: gmapsUrl,
           source: 'Google Maps & OSM Live'
         });

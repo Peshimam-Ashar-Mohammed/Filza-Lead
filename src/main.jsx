@@ -89,6 +89,7 @@ function App() {
   const [statusType, setStatusType] = useState('info');
   const [copiedId, setCopiedId] = useState(null);
   const [allCopied, setAllCopied] = useState(false);
+  const [refreshCount, setRefreshCount] = useState(0);
 
   // Available regions for current country
   const currentCountryObj = countriesData[selectedCountry] || {};
@@ -134,11 +135,16 @@ function App() {
   };
 
   // Execute Lead Discovery
-  const handleSearch = async (e) => {
+  const handleSearch = async (e, options = {}) => {
     if (e && e.preventDefault) e.preventDefault();
+    const forceRefresh = Boolean(options.forceRefresh);
+    const nextRefreshCount = forceRefresh ? refreshCount + 1 : refreshCount;
+    if (forceRefresh) setRefreshCount(nextRefreshCount);
     setLoading(true);
     const targetLoc = selectedCity !== 'All Cities' ? selectedCity : selectedRegion !== 'All Regions' ? selectedRegion : selectedCountry;
-    setStatusMessage(`Scanning real business registries & Google Maps in ${targetLoc}...`);
+    setStatusMessage(forceRefresh
+      ? `Refreshing verified public listings in ${targetLoc} for more business names...`
+      : `Scanning real business registries & Google Maps in ${targetLoc}...`);
     setStatusType('info');
 
     try {
@@ -150,13 +156,17 @@ function App() {
         targetCount: parseInt(selectedVolume, 10),
         radius: parseInt(selectedRadius, 10),
         filterType: selectedQuality,
-        googleApiKey: googleApiKey
+        googleApiKey: googleApiKey,
+        forceRefresh,
+        refreshSeed: nextRefreshCount
       });
 
       setLeads(results);
       setStatusType('success');
       const apiSource = googleApiKey ? 'Google Places Official API' : 'Google Maps & Verified Registry';
-      setStatusMessage(`Found ${results.length} real business leads in ${targetLoc} (${apiSource}).`);
+      setStatusMessage(forceRefresh
+        ? `Refreshed ${results.length} verified leads in ${targetLoc}. Only public listing data is shown; missing contacts stay marked Not Listed.`
+        : `Found ${results.length} real business leads in ${targetLoc} (${apiSource}).`);
     } catch (err) {
       console.error(err);
       setStatusType('error');
@@ -197,7 +207,8 @@ function App() {
     if (!leads.length) return { total: 0, withPhone: 0, withWeb: 0, avgRating: '0.0' };
     const withPhone = leads.filter(l => l.phone && l.phone.trim().length > 3).length;
     const withWeb = leads.filter(l => l.website && l.website.startsWith('http')).length;
-    const avg = leads.reduce((sum, l) => sum + l.rating, 0) / leads.length;
+    const ratedLeads = leads.filter(l => Number(l.rating) > 0);
+    const avg = ratedLeads.length ? ratedLeads.reduce((sum, l) => sum + l.rating, 0) / ratedLeads.length : 0;
     return {
       total: leads.length,
       withPhone,
@@ -645,6 +656,17 @@ function App() {
               <button
                 type="button"
                 className="btn-secondary"
+                onClick={(e) => handleSearch(e, { forceRefresh: true })}
+                disabled={loading}
+                title="Refresh from public directories and look for additional verified business names"
+              >
+                <RefreshCw size={16} className={loading ? 'spinner' : ''} />
+                <span>Refresh Leads</span>
+              </button>
+
+              <button
+                type="button"
+                className="btn-secondary"
                 onClick={handleCopyAll}
                 disabled={!leads.length}
                 title="Copy all leads formatted for Excel/Google Sheets"
@@ -755,11 +777,17 @@ function App() {
                     </td>
                     <td>
                       <div className="rating-cell">
-                        <span className="rating-number">{lead.rating}</span>
-                        <div className="star-wrapper">
-                          <Star size={13} className="star-icon" />
-                        </div>
-                        <span className="review-count">({lead.reviews})</span>
+                        {Number(lead.rating) > 0 ? (
+                          <>
+                            <span className="rating-number">{lead.rating}</span>
+                            <div className="star-wrapper">
+                              <Star size={13} className="star-icon" />
+                            </div>
+                            <span className="review-count">({lead.reviews})</span>
+                          </>
+                        ) : (
+                          <span className="unlisted-text">No public rating</span>
+                        )}
                       </div>
                     </td>
                     <td className="text-right actions-cell">
