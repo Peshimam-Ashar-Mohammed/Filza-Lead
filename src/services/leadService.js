@@ -9,7 +9,7 @@ import { categoriesList } from '../data/categoriesData.js';
 //  CACHING LAYER — Prevents repeated API calls for the same queries
 // ═══════════════════════════════════════════════════════════════════════
 
-const CACHE_VERSION = 'flz_v2';
+const CACHE_VERSION = 'flz_v3';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // In-memory cache (instant for same session)
@@ -90,11 +90,12 @@ async function fetchNominatim(url, retries = 3) {
     lastNominatimRequest = Date.now();
 
     try {
+      const reqHeaders = { 'Accept': 'application/json' };
+      if (typeof window === 'undefined') {
+        reqHeaders['User-Agent'] = 'FilzaLead/2.0 (lead-discovery; contact@filzalead.app)';
+      }
       const res = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'FilzaLead/2.0 (lead-discovery-tool; contact@filzalead.app)'
-        }
+        headers: reqHeaders
       });
 
       if (res.status === 429 || res.status === 503) {
@@ -498,6 +499,231 @@ export async function searchGooglePlaces(apiKey, { query, location, targetCount 
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  CONTACT DATA NORMALIZATION & ENRICHMENT (Zero-Hallucination)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Normalizes URL string to ensure proper protocol (https://) and clean format
+ */
+export function normalizeUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  let clean = url.trim();
+  if (clean.includes(';')) clean = clean.split(';')[0].trim();
+  if (clean.includes(' ') && !clean.startsWith('http')) clean = clean.split(/\s+/)[0];
+  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+    if (clean.includes('.') || clean.includes('/')) {
+      clean = `https://${clean}`;
+    }
+  }
+  return clean;
+}
+
+/**
+ * Extracts phone, website, and email across all known OpenStreetMap tag variants.
+ */
+function extractContactFromTags(extratags = {}) {
+  if (!extratags || typeof extratags !== 'object') {
+    return { phone: '', website: '', email: '' };
+  }
+
+  // 1. All standard OSM phone tag keys
+  const phoneKeys = [
+    'phone',
+    'contact:phone',
+    'telephone',
+    'contact:telephone',
+    'mobile',
+    'contact:mobile',
+    'phone:mobile',
+    'tel',
+    'operator:phone',
+    'branch:phone',
+    'brand:phone',
+    'reservation:phone',
+    'emergency:phone',
+    'toll_free:phone',
+    'contact:whatsapp',
+    'whatsapp'
+  ];
+  let phone = '';
+  for (const k of phoneKeys) {
+    const val = extratags[k];
+    if (val && typeof val === 'string' && val.trim().length >= 4) {
+      phone = val.trim();
+      break;
+    }
+  }
+
+  // 2. All standard OSM website tag keys
+  const websiteKeys = [
+    'website',
+    'contact:website',
+    'url',
+    'contact:url',
+    'official_website',
+    'website:official',
+    'operator:website',
+    'brand:website',
+    'branch:website',
+    'link',
+    'reservation:website',
+    'heritage:website',
+    'source_ref:1',
+    'contact:facebook',
+    'facebook',
+    'contact:instagram',
+    'instagram',
+    'contact:linkedin',
+    'linkedin'
+  ];
+  let website = '';
+  for (const k of websiteKeys) {
+    const val = extratags[k];
+    if (val && typeof val === 'string' && val.trim().length > 3) {
+      website = val.trim();
+      break;
+    }
+  }
+
+  if (website) {
+    website = normalizeUrl(website);
+  }
+
+  // 3. All standard OSM email tag keys
+  const emailKeys = [
+    'email',
+    'contact:email',
+    'operator:email',
+    'reservation:email',
+    'branch:email'
+  ];
+  let email = '';
+  for (const k of emailKeys) {
+    const val = extratags[k];
+    if (val && typeof val === 'string' && val.includes('@')) {
+      email = val.trim().split(';')[0].trim();
+      break;
+    }
+  }
+
+  return { phone, website, email };
+}
+
+/**
+ * Enrich leads that are missing website or phone using linked Wikidata claims (P856 & P1329)
+ * and verified Wikipedia articles. Runs in a single batch request (<500ms).
+ */
+async function enrichLeadsWithWikidata(leads) {
+  const leadsToEnrich = leads.filter(
+    l => (!l.website || !l.phone) && (l._wikidataId || l._brandWikidataId || l._wikipediaTitle)
+  );
+  if (!leadsToEnrich.length) return;
+
+  // 1. Gather all unique Wikidata IDs
+  const qIdSet = new Set();
+  leadsToEnrich.forEach(l => {
+    if (l._wikidataId && l._wikidataId.startsWith('Q')) qIdSet.add(l._wikidataId);
+    if (l._brandWikidataId && l._brandWikidataId.startsWith('Q')) qIdSet.add(l._brandWikidataId);
+  });
+  const qIds = Array.from(qIdSet).slice(0, 50);
+
+  if (qIds.length > 0) {
+    try {
+      const url = `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${qIds.join('|')}&props=claims&format=json&origin=*`;
+      const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+      if (res.ok) {
+        const data = await res.json();
+        const entities = data.entities || {};
+
+        for (const lead of leadsToEnrich) {
+          const ent = entities[lead._wikidataId] || entities[lead._brandWikidataId];
+          if (!ent || !ent.claims) continue;
+
+          // Official website (Property P856)
+          if (!lead.website) {
+            const p856 = ent.claims.P856;
+            if (p856 && Array.isArray(p856) && p856.length > 0) {
+              const val = p856[0]?.mainsnak?.datavalue?.value;
+              if (val && typeof val === 'string') {
+                lead.website = normalizeUrl(val);
+              }
+            }
+          }
+
+          // Official phone (Property P1329)
+          if (!lead.phone) {
+            const p1329 = ent.claims.P1329;
+            if (p1329 && Array.isArray(p1329) && p1329.length > 0) {
+              const val = p1329[0]?.mainsnak?.datavalue?.value;
+              if (val && typeof val === 'string') {
+                lead.phone = val.trim();
+              }
+            }
+          }
+
+          // Official email (Property P968)
+          if (!lead.email) {
+            const p968 = ent.claims.P968;
+            if (p968 && Array.isArray(p968) && p968.length > 0) {
+              const val = p968[0]?.mainsnak?.datavalue?.value;
+              if (val && typeof val === 'string') {
+                lead.email = val.trim();
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.debug('Wikidata ID enrichment non-fatal error:', err.message);
+    }
+  }
+
+  // 2. For leads that still have no website but have a Wikipedia article title, batch fetch or fallback
+  const leadsWithWikiTitle = leadsToEnrich.filter(l => !l.website && l._wikipediaTitle);
+  if (leadsWithWikiTitle.length > 0) {
+    const titles = Array.from(
+      new Set(leadsWithWikiTitle.map(l => l._wikipediaTitle.replace(/^[a-z]{2}:/, '').replace(/\s+/g, '_')))
+    ).slice(0, 50);
+
+    if (titles.length > 0) {
+      try {
+        const wikiUrl = `https://www.wikidata.org/w/api.php?action=wbgetentities&sites=enwiki&titles=${titles.map(encodeURIComponent).join('|')}&props=claims&format=json&origin=*`;
+        const res = await fetch(wikiUrl, { headers: { 'Accept': 'application/json' } });
+        if (res.ok) {
+          const data = await res.json();
+          const entities = data.entities || {};
+
+          for (const ent of Object.values(entities)) {
+            if (!ent || !ent.claims) continue;
+            const site = ent.claims.P856?.[0]?.mainsnak?.datavalue?.value;
+            const phone = ent.claims.P1329?.[0]?.mainsnak?.datavalue?.value;
+            const sits = ent.sitelinks?.enwiki?.title?.replace(/\s+/g, '_').toLowerCase();
+
+            for (const lead of leadsWithWikiTitle) {
+              const leadCleanTitle = lead._wikipediaTitle.replace(/^[a-z]{2}:/, '').replace(/\s+/g, '_').toLowerCase();
+              if (sits === leadCleanTitle || ent.id === lead._wikidataId) {
+                if (!lead.website && site) lead.website = normalizeUrl(site);
+                if (!lead.phone && phone) lead.phone = phone.trim();
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.debug('Wikidata Wikipedia title lookup non-fatal error:', err.message);
+      }
+    }
+
+    // 3. Fallback: If still no official website, but verified Wikipedia article exists, link to the Wikipedia profile
+    for (const lead of leadsWithWikiTitle) {
+      if (!lead.website && lead._wikipediaTitle) {
+        const cleanTitle = lead._wikipediaTitle.replace(/^[a-z]{2}:/, '').replace(/\s+/g, '_');
+        lead.website = `https://en.wikipedia.org/wiki/${encodeURIComponent(cleanTitle)}`;
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  MAIN LEAD SEARCH (with rate limiting + caching)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -518,12 +744,42 @@ export async function searchLeads({
   forceRefresh = false,
   refreshSeed = 0
 }) {
-  const catObj = categoriesList.find(c => c.id === category) || categoriesList[0];
-  const targetCity = (city && city !== 'All Cities' && city !== 'All Cities / Metro Center')
-    ? city
-    : (region && region !== 'All Regions' && region !== 'Nationwide (All Regions)' ? region : country);
+  if (!country || !country.trim()) return [];
 
-  const cleanLocationQuery = `${targetCity}, ${region && region !== 'All Regions' ? region + ', ' : ''}${country}`;
+  const countryObj = countriesData[country] || {};
+  const countryCode = (countryObj.code || '').toLowerCase();
+  const catObj = categoriesList.find(c => c.id === category) || categoriesList[0];
+
+  // Resolve a concrete city or urban hub to prevent nationwide query timeouts in Nominatim
+  let targetCity = '';
+  if (city && city !== 'All Cities' && city !== 'All Cities / Metro Center' && city.trim()) {
+    targetCity = city.trim();
+  } else if (region && region !== 'All Regions' && region !== 'Nationwide (All Regions)' && region.trim()) {
+    const regObj = countryObj.regions ? countryObj.regions[region] : null;
+    if (regObj && Array.isArray(regObj.cities) && regObj.cities.length > 0) {
+      targetCity = regObj.cities[0];
+    } else {
+      targetCity = region.trim();
+    }
+  } else if (countryObj.regions) {
+    const firstReg = Object.values(countryObj.regions)[0];
+    if (firstReg && Array.isArray(firstReg.cities) && firstReg.cities.length > 0) {
+      targetCity = firstReg.cities[0];
+    } else {
+      targetCity = country;
+    }
+  } else {
+    targetCity = country;
+  }
+
+  // Build clean, deduplicated location string
+  const locParts = [];
+  if (targetCity && targetCity !== country) locParts.push(targetCity);
+  if (region && region !== 'All Regions' && region !== 'Nationwide (All Regions)' && region !== targetCity) {
+    locParts.push(region);
+  }
+  if (country) locParts.push(country);
+  const cleanLocationQuery = locParts.join(', ');
 
   // Check full search cache first — if we already searched this exact combo, return instantly
   const fullSearchCacheKey = getCacheKey('search', { country, region, city, category, targetCount, filterType, hasGoogleKey: !!googleApiKey });
@@ -548,7 +804,7 @@ export async function searchLeads({
       if (googleResults.length > 0) {
         googleResults.forEach(r => {
           r.city = targetCity;
-          r.region = region !== 'All Regions' ? region : '';
+          r.region = region && region !== 'All Regions' ? region : '';
           r.country = country;
         });
         const filtered = applyFilters(googleResults, filterType);
@@ -557,7 +813,6 @@ export async function searchLeads({
       }
     } catch (err) {
       console.warn('Google Places API call failed, falling back to verified directory:', err.message);
-      // We gracefully continue to our verified local extraction
     }
   }
 
@@ -573,44 +828,45 @@ export async function searchLeads({
     }
   };
 
-  // Check verified local database for real known establishments with tested working domains
-  const cityKey = Object.keys(VERIFIED_CITY_DIRECTORY).find(
-    k => targetCity.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(targetCity.toLowerCase())
-  );
+  // Check verified local database — strictly ONLY if country is India
+  if (country === 'India') {
+    const cityKey = Object.keys(VERIFIED_CITY_DIRECTORY).find(
+      k => targetCity.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(targetCity.toLowerCase())
+    );
 
-  if (cityKey && VERIFIED_CITY_DIRECTORY[cityKey]) {
-    const localReal = VERIFIED_CITY_DIRECTORY[cityKey];
-    for (const place of localReal) {
-      const matchesCat = catObj.id === 'all' || place.category.toLowerCase().includes(catObj.label.toLowerCase().slice(0, 8));
-      if (matchesCat) {
-        addLead({
-          id: `verified-${place.name.replace(/\s+/g, '-').toLowerCase()}`,
-          name: place.name,
-          category: place.category,
-          phone: place.phone || '', // authentic only
-          email: '', // never fabricated
-          website: place.website || '', // only verified working domains
-          address: place.address,
-          city: targetCity,
-          region: region !== 'All Regions' ? region : '',
-          country: country,
-          lat: place.lat,
-          lon: place.lon,
-          rating: place.rating,
-          reviews: place.reviews,
-          status: place.status,
-          googleMapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place.name + ' ' + targetCity + ' ' + country)}`,
-          source: 'Google Maps Verified'
-        });
+    if (cityKey && VERIFIED_CITY_DIRECTORY[cityKey]) {
+      const localReal = VERIFIED_CITY_DIRECTORY[cityKey];
+      for (const place of localReal) {
+        const matchesCat = catObj.id === 'all' || place.category.toLowerCase().includes(catObj.label.toLowerCase().slice(0, 8));
+        if (matchesCat) {
+          addLead({
+            id: `verified-${place.name.replace(/\s+/g, '-').toLowerCase()}`,
+            name: place.name,
+            category: place.category,
+            phone: place.phone || '',
+            email: '',
+            website: place.website || '',
+            address: place.address,
+            city: targetCity,
+            region: region && region !== 'All Regions' ? region : 'Andhra Pradesh',
+            country: 'India',
+            lat: place.lat,
+            lon: place.lon,
+            rating: place.rating,
+            reviews: place.reviews,
+            status: place.status,
+            googleMapsUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place.name + ' ' + targetCity + ' India')}`,
+            source: 'Google Maps Verified'
+          });
+        }
       }
     }
   }
 
-  // Query Nominatim SEQUENTIALLY (not parallel!) to respect their 1 req/sec rate limit
+  // Query Nominatim SEQUENTIALLY to respect their rate limit
   const searchTerms = catObj.searchKeywords || ['hospital', 'hotel', 'restaurant', 'bank', 'school', 'shop', 'office'];
 
-  // Refresh rotates through more public directory terms while keeping requests modest.
-  const termWindowSize = forceRefresh ? 7 : 4;
+  const termWindowSize = forceRefresh ? 6 : 4;
   const rotationStart = forceRefresh && searchTerms.length
     ? refreshSeed % searchTerms.length
     : 0;
@@ -621,14 +877,19 @@ export async function searchLeads({
     for (const term of termsToSearch) {
       if (collectedLeads.length >= targetCount) break;
 
-      const query = `${term} in ${cleanLocationQuery}`;
+      const query = targetCity && targetCity !== country
+        ? `${term} in ${targetCity}`
+        : `${term} in ${country}`;
 
       // Check per-term cache
-      const termCacheKey = getCacheKey('nominatim', { query });
+      const termCacheKey = getCacheKey('nominatim', { query, countryCode });
       let items = forceRefresh ? null : getFromCache(termCacheKey);
 
       if (!items) {
-        const url = `https://nominatim.openstreetmap.org/search?format=json&limit=8&addressdetails=1&extratags=1&q=${encodeURIComponent(query)}`;
+        const isDev = import.meta.env?.DEV;
+        const nominatimBaseUrl = isDev ? '/api/nominatim' : 'https://nominatim.openstreetmap.org';
+        const countryParam = countryCode ? `&countrycodes=${encodeURIComponent(countryCode)}` : '';
+        const url = `${nominatimBaseUrl}/search?format=json&limit=8&addressdetails=1&extratags=1${countryParam}&q=${encodeURIComponent(query)}`;
         const result = await fetchNominatim(url);
         if (result && Array.isArray(result)) {
           items = result.map(item => ({ ...item, queryTerm: term }));
@@ -643,36 +904,42 @@ export async function searchLeads({
         const cleanName = item.name.trim();
 
         const addr = item.address || {};
+        // Strict country validation: ensure item is in the requested country
+        if (countryCode && addr.country_code && addr.country_code.toLowerCase() !== countryCode) {
+          continue;
+        }
+
         const road = addr.road || addr.suburb || addr.neighbourhood || addr.city_district || 'Commercial District';
         const postcode = addr.postcode ? `, ${addr.postcode}` : '';
         const placeCity = addr.city || addr.town || addr.village || addr.county || targetCity;
-        const placeState = addr.state || region || '';
-        const fullAddress = `${road}${postcode}, ${placeCity}, ${placeState}, ${country}`;
+        const placeState = addr.state || (region && region !== 'All Regions' ? region : '') || '';
+        const placeCountry = addr.country || country;
+        const fullAddress = `${road}${postcode}, ${placeCity}${placeState ? ', ' + placeState : ''}, ${placeCountry}`;
 
-        // ZERO HALLUCINATION: Only use phone/website if it actually exists in official OSM tags
-        const rawPhone = item.extratags?.phone || item.extratags?.['contact:phone'] || '';
-        const rawWebsite = item.extratags?.website || item.extratags?.['contact:website'] || '';
-
-        const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${cleanName} ${placeCity} ${country}`)}`;
+        const contacts = extractContactFromTags(item.extratags);
+        const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${cleanName} ${placeCity} ${placeCountry}`)}`;
 
         addLead({
           id: `osm-${item.place_id || `${cleanName}-${placeCity}`}`,
           name: cleanName,
           category: normalizeCategoryName(item.type || item.queryTerm, catObj),
-          phone: rawPhone, // Empty string if not in public tags - NEVER generate random numbers!
-          email: item.extratags?.email || item.extratags?.['contact:email'] || '', // Empty if not in public tags!
-          website: rawWebsite, // Empty if not verified!
+          phone: contacts.phone,
+          email: contacts.email,
+          website: contacts.website,
           address: fullAddress,
           city: placeCity,
           region: placeState,
-          country: country,
+          country: placeCountry,
           lat: parseFloat(item.lat),
           lon: parseFloat(item.lon),
           rating: 0,
           reviews: 0,
           status: 'Public Directory Verified Place',
           googleMapsUrl: gmapsUrl,
-          source: 'Google Maps & OSM Live'
+          source: 'Google Maps & OSM Live',
+          _wikidataId: item.extratags?.wikidata || '',
+          _brandWikidataId: item.extratags?.['brand:wikidata'] || item.extratags?.['operator:wikidata'] || '',
+          _wikipediaTitle: item.extratags?.wikipedia || item.extratags?.['brand:wikipedia'] || item.extratags?.['operator:wikipedia'] || ''
         });
 
         if (collectedLeads.length >= targetCount) break;
@@ -680,6 +947,22 @@ export async function searchLeads({
     }
   } catch (err) {
     console.debug('Live place lookup completed with current buffer:', err.message);
+  }
+
+  // Batch enrich leads that are missing website or phone via linked open databases (Wikidata / Wikipedia)
+  if (collectedLeads.length > 0) {
+    try {
+      await enrichLeadsWithWikidata(collectedLeads);
+    } catch (enrichErr) {
+      console.debug('Lead contact enrichment completed with partial data:', enrichErr.message);
+    }
+
+    // Clean up temporary internal metadata properties
+    collectedLeads.forEach(l => {
+      delete l._wikidataId;
+      delete l._brandWikidataId;
+      delete l._wikipediaTitle;
+    });
   }
 
   let finalLeads = collectedLeads.slice(0, targetCount);
@@ -692,10 +975,10 @@ export async function searchLeads({
 
 function applyFilters(leads, filterType) {
   if (filterType === 'phone') {
-    return leads.filter(l => l.phone && l.phone.trim().length > 5);
+    return leads.filter(l => l.phone && l.phone.trim().length > 3);
   }
   if (filterType === 'website') {
-    return leads.filter(l => l.website && l.website.startsWith('http'));
+    return leads.filter(l => l.website && (l.website.startsWith('http') || l.website.includes('.')));
   }
   if (filterType === 'top_rated') {
     return leads.filter(l => l.rating >= 4.5);

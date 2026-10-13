@@ -62,18 +62,34 @@ const EXPORT_OPTIONS = [
   { value: 'csv', label: 'CSV Spreadsheet (.csv)' }
 ];
 
+function formatDisplayUrl(url) {
+  if (!url) return '';
+  try {
+    const raw = url.startsWith('http') ? url : `https://${url}`;
+    const parsed = new URL(raw);
+    const domain = parsed.hostname.replace(/^www\./, '');
+    const pathname = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.replace(/\/$/, '') : '';
+    const display = domain + (pathname.length <= 15 ? pathname : pathname.slice(0, 13) + '…');
+    return display;
+  } catch {
+    const clean = url.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '');
+    return clean.length > 22 ? clean.slice(0, 20) + '…' : clean;
+  }
+}
+
 function App() {
-  // Dropdown-only state (Zero text inputs in query flow)
-  const [selectedCountry, setSelectedCountry] = useState('India');
-  const [selectedRegion, setSelectedRegion] = useState('Andhra Pradesh');
-  const [selectedCity, setSelectedCity] = useState('Guntur');
-  const [selectedCategory, setSelectedCategory] = useState('all');
+  // Dropdown-only state (Zero text inputs in query flow - defaults empty for user selection)
+  const [selectedCountry, setSelectedCountry] = useState('');
+  const [selectedRegion, setSelectedRegion] = useState('');
+  const [selectedCity, setSelectedCity] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('');
   const [selectedVolume, setSelectedVolume] = useState('30');
   const [selectedRadius, setSelectedRadius] = useState('15000');
   const [selectedQuality, setSelectedQuality] = useState('all');
   const [selectedSort, setSelectedSort] = useState('rating_desc');
   const [selectedExportFormat, setSelectedExportFormat] = useState('excel');
   const [viewFilter, setViewFilter] = useState('all');
+  const [hasSearched, setHasSearched] = useState(false);
 
   // Google Places API State
   const [googleApiKey, setGoogleApiKey] = useState(() => localStorage.getItem('filzalead_google_api_key') || '');
@@ -92,67 +108,83 @@ function App() {
   const [refreshCount, setRefreshCount] = useState(0);
 
   // Available regions for current country
-  const currentCountryObj = countriesData[selectedCountry] || {};
+  const currentCountryObj = selectedCountry ? countriesData[selectedCountry] || {} : {};
   const regionNames = useMemo(() => {
-    if (!currentCountryObj.regions) return ['All Regions'];
-    return ['All Regions', ...Object.keys(currentCountryObj.regions)];
-  }, [currentCountryObj]);
+    if (!selectedCountry || !currentCountryObj.regions) return [];
+    return Object.keys(currentCountryObj.regions);
+  }, [selectedCountry, currentCountryObj]);
 
   // Available cities for current country + region
   const cityNames = useMemo(() => {
-    if (!currentCountryObj.regions) return ['All Cities'];
-    if (selectedRegion === 'All Regions') {
+    if (!selectedCountry || !currentCountryObj.regions) return [];
+    if (!selectedRegion || selectedRegion === 'All Regions') {
       const allCities = new Set();
       Object.values(currentCountryObj.regions).forEach(reg => {
         if (Array.isArray(reg.cities)) {
           reg.cities.forEach(c => allCities.add(c));
         }
       });
-      return ['All Cities', ...Array.from(allCities).slice(0, 15)];
+      return Array.from(allCities).slice(0, 20);
     }
     const reg = currentCountryObj.regions[selectedRegion];
     if (reg && Array.isArray(reg.cities)) {
-      return ['All Cities', ...reg.cities];
+      return reg.cities;
     }
-    return ['All Cities', 'Central District', 'Metro Downtown', 'Commercial Area'];
-  }, [currentCountryObj, selectedRegion]);
+    return ['Central District', 'Metro Downtown', 'Commercial Area'];
+  }, [selectedCountry, currentCountryObj, selectedRegion]);
 
-  // Handle country switch: update region & city dropdowns cleanly
+  // Handle country switch: update region & city dropdowns cleanly and clear previous leads
   const handleCountryChange = (e) => {
     const newCountry = e.target.value;
     setSelectedCountry(newCountry);
-    const countryObj = countriesData[newCountry];
-    const firstReg = countryObj && countryObj.regions ? Object.keys(countryObj.regions)[0] : 'All Regions';
-    setSelectedRegion(firstReg || 'All Regions');
-    setSelectedCity('All Cities');
+    setSelectedRegion('');
+    setSelectedCity('');
+    // Clear leads immediately so other country's output never persists
+    setLeads([]);
+    setHasSearched(false);
+    setStatusMessage('');
+    setStatusType('info');
+    setAllCopied(false);
   };
 
-  // Handle region switch: reset city dropdown cleanly
+  // Handle region switch: reset city dropdown cleanly and clear previous leads
   const handleRegionChange = (e) => {
     const newRegion = e.target.value;
     setSelectedRegion(newRegion);
-    setSelectedCity('All Cities');
+    setSelectedCity('');
+    setLeads([]);
+    setHasSearched(false);
+    setStatusMessage('');
   };
 
   // Execute Lead Discovery
   const handleSearch = async (e, options = {}) => {
     if (e && e.preventDefault) e.preventDefault();
+    if (!selectedCountry) {
+      setStatusType('error');
+      setStatusMessage('Please select a country from the dropdown first.');
+      return;
+    }
+
     const forceRefresh = Boolean(options.forceRefresh);
     const nextRefreshCount = forceRefresh ? refreshCount + 1 : refreshCount;
     if (forceRefresh) setRefreshCount(nextRefreshCount);
     setLoading(true);
-    const targetLoc = selectedCity !== 'All Cities' ? selectedCity : selectedRegion !== 'All Regions' ? selectedRegion : selectedCountry;
+    setHasSearched(true);
+    const targetLoc = (selectedCity && selectedCity !== 'All Cities')
+      ? selectedCity
+      : (selectedRegion && selectedRegion !== 'All Regions' ? selectedRegion : selectedCountry);
     setStatusMessage(forceRefresh
-      ? `Refreshing verified public listings in ${targetLoc} for more business names...`
-      : `Scanning real business registries & Google Maps in ${targetLoc}...`);
+      ? `Refreshing verified public listings in ${targetLoc} (${selectedCountry})...`
+      : `Scanning verified business registries in ${targetLoc} (${selectedCountry})...`);
     setStatusType('info');
 
     try {
       const results = await searchLeads({
         country: selectedCountry,
-        region: selectedRegion,
-        city: selectedCity,
-        category: selectedCategory,
+        region: selectedRegion || 'All Regions',
+        city: selectedCity || 'All Cities',
+        category: selectedCategory || 'all',
         targetCount: parseInt(selectedVolume, 10),
         radius: parseInt(selectedRadius, 10),
         filterType: selectedQuality,
@@ -162,11 +194,16 @@ function App() {
       });
 
       setLeads(results);
-      setStatusType('success');
-      const apiSource = googleApiKey ? 'Google Places Official API' : 'Google Maps & Verified Registry';
-      setStatusMessage(forceRefresh
-        ? `Refreshed ${results.length} verified leads in ${targetLoc}. Only public listing data is shown; missing contacts stay marked Not Listed.`
-        : `Found ${results.length} real business leads in ${targetLoc} (${apiSource}).`);
+      if (results.length > 0) {
+        setStatusType('success');
+        const apiSource = googleApiKey ? 'Google Places Official API' : 'Google Maps & Verified Public Directory';
+        setStatusMessage(forceRefresh
+          ? `Refreshed ${results.length} verified leads in ${targetLoc} (${selectedCountry}).`
+          : `Found ${results.length} real business leads in ${targetLoc} (${selectedCountry}) via ${apiSource}.`);
+      } else {
+        setStatusType('info');
+        setStatusMessage(`No public leads found for ${targetLoc} (${selectedCountry}) with the selected filters. Try choosing another city or broadening the category.`);
+      }
     } catch (err) {
       console.error(err);
       setStatusType('error');
@@ -176,11 +213,6 @@ function App() {
     }
   };
 
-  // Auto-run once on mount
-  useEffect(() => {
-    handleSearch();
-  }, []);
-
   // Filtered & Sorted leads for the table
   const displayedLeads = useMemo(() => {
     let list = [...leads];
@@ -188,7 +220,7 @@ function App() {
     if (viewFilter === 'phone') {
       list = list.filter(l => l.phone && l.phone.trim().length > 3);
     } else if (viewFilter === 'website') {
-      list = list.filter(l => l.website && l.website.startsWith('http'));
+      list = list.filter(l => l.website && (l.website.startsWith('http') || l.website.includes('.')));
     }
 
     if (selectedSort === 'rating_desc') {
@@ -206,7 +238,7 @@ function App() {
   const stats = useMemo(() => {
     if (!leads.length) return { total: 0, withPhone: 0, withWeb: 0, avgRating: '0.0' };
     const withPhone = leads.filter(l => l.phone && l.phone.trim().length > 3).length;
-    const withWeb = leads.filter(l => l.website && l.website.startsWith('http')).length;
+    const withWeb = leads.filter(l => l.website && (l.website.startsWith('http') || l.website.includes('.'))).length;
     const ratedLeads = leads.filter(l => Number(l.rating) > 0);
     const avg = ratedLeads.length ? ratedLeads.reduce((sum, l) => sum + l.rating, 0) / ratedLeads.length : 0;
     return {
@@ -220,7 +252,7 @@ function App() {
   // Export handlers
   const handleExport = () => {
     if (!leads.length) return;
-    const cleanLocation = `${selectedCountry}-${selectedRegion !== 'All Regions' ? selectedRegion : 'Nationwide'}`.replace(/\s+/g, '_');
+    const cleanLocation = `${selectedCountry || 'Global'}-${selectedRegion && selectedRegion !== 'All Regions' ? selectedRegion : 'Nationwide'}`.replace(/\s+/g, '_');
     const filename = `FilzaLead_${cleanLocation}_${Date.now()}`;
 
     if (selectedExportFormat === 'excel') {
@@ -279,8 +311,13 @@ function App() {
     setApiTestMessage('Testing connection to Google Places API...');
 
     try {
+      const testQuery = selectedCity && selectedCity !== 'All Cities'
+        ? `restaurants in ${selectedCity}`
+        : selectedCountry
+          ? `restaurants in ${selectedCountry}`
+          : 'restaurants';
       const testRes = await searchGooglePlaces(tempApiKey.trim(), {
-        query: 'restaurants in Guntur',
+        query: testQuery,
         targetCount: 1
       });
       if (testRes) {
@@ -364,7 +401,7 @@ function App() {
             <ShieldCheck size={14} />
             <span>ACCURATE B2B LEADS • 100% REAL PLACES & VERIFIED CONTACTS</span>
           </div>
-          <h1>Discover Verified Business Leads Worldwide</h1>
+          <h1>Discover <span className="gradient-text">Verified Business Leads</span> Worldwide</h1>
           <p>
             Select your country, region, city, and business sector using the dropdowns below.
             FilzaLead discovers real, verified commercial entities with Google Maps cross-verification.
@@ -395,6 +432,7 @@ function App() {
                   value={selectedCountry}
                   onChange={handleCountryChange}
                 >
+                  <option value="">-- Select Country --</option>
                   {countryList.map((countryName) => (
                     <option key={countryName} value={countryName}>
                       {countryName}
@@ -415,7 +453,12 @@ function App() {
                   id="region-select"
                   value={selectedRegion}
                   onChange={handleRegionChange}
+                  disabled={!selectedCountry}
                 >
+                  <option value="">
+                    {selectedCountry ? '-- Select Region / State (Optional) --' : '-- Select Country First --'}
+                  </option>
+                  {selectedCountry && <option value="All Regions">All Regions (Nationwide)</option>}
                   {regionNames.map((r) => (
                     <option key={r} value={r}>
                       {r}
@@ -435,8 +478,17 @@ function App() {
                 <select
                   id="city-select"
                   value={selectedCity}
-                  onChange={(e) => setSelectedCity(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedCity(e.target.value);
+                    setLeads([]);
+                    setHasSearched(false);
+                  }}
+                  disabled={!selectedCountry}
                 >
+                  <option value="">
+                    {selectedCountry ? '-- Select City / Hub (Optional) --' : '-- Select Country First --'}
+                  </option>
+                  {selectedCountry && <option value="All Cities">All Cities (Metro Areas)</option>}
                   {cityNames.map((c) => (
                     <option key={c} value={c}>
                       {c}
@@ -456,8 +508,13 @@ function App() {
                 <select
                   id="category-select"
                   value={selectedCategory}
-                  onChange={(e) => setSelectedCategory(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedCategory(e.target.value);
+                    setLeads([]);
+                    setHasSearched(false);
+                  }}
                 >
+                  <option value="">-- Select Industry / Category --</option>
                   {categoriesList.map((cat) => (
                     <option key={cat.id} value={cat.id}>
                       {cat.label}
@@ -556,7 +613,7 @@ function App() {
               <button
                 type="submit"
                 className="btn-discover"
-                disabled={loading}
+                disabled={loading || !selectedCountry}
               >
                 {loading ? (
                   <>
@@ -566,7 +623,11 @@ function App() {
                 ) : (
                   <>
                     <Search size={18} />
-                    <span>Find Real Leads ({selectedCity !== 'All Cities' ? selectedCity : selectedCountry})</span>
+                    <span>
+                      {selectedCountry
+                        ? `Find Real Leads (${selectedCity && selectedCity !== 'All Cities' ? selectedCity : (selectedRegion && selectedRegion !== 'All Regions' ? selectedRegion : selectedCountry)})`
+                        : 'Select a Country to Search'}
+                    </span>
                   </>
                 )}
               </button>
@@ -692,6 +753,15 @@ function App() {
           {/* Leads Table */}
           <div className="table-wrapper">
             <table className="leads-table">
+              <colgroup>
+                <col style={{ width: '22%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '14%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '18%' }} />
+                <col style={{ width: '7%' }} />
+                <col style={{ width: '9%' }} />
+              </colgroup>
               <thead>
                 <tr>
                   <th>Business Entity</th>
@@ -713,13 +783,16 @@ function App() {
                       </div>
                     </td>
                     <td>
-                      <span className="category-badge">{lead.category}</span>
+                      <span className="category-badge" title={lead.category}>{lead.category}</span>
                     </td>
                     <td>
                       {lead.phone ? (
                         <div className="phone-wrapper">
-                          <a href={`tel:${lead.phone}`} className="contact-link phone">
-                            <Phone size={13} />
+                          <a
+                            href={`tel:${lead.phone.split(/[;,]/)[0].trim().replace(/[\s()-]/g, '')}`}
+                            className="contact-link phone"
+                          >
+                            <Phone size={13} className="shrink-0" />
                             <span>{lead.phone}</span>
                           </a>
                         </div>
@@ -733,7 +806,7 @@ function App() {
                             className="lookup-link"
                             title="Search verified phone on Google"
                           >
-                            <Search size={11} />
+                            <Search size={11} className="shrink-0" />
                             <span>Find Phone</span>
                           </a>
                         </div>
@@ -743,14 +816,15 @@ function App() {
                       <div className="web-links-cell">
                         {lead.website ? (
                           <a
-                            href={lead.website}
+                            href={lead.website.startsWith('http') ? lead.website : `https://${lead.website}`}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="contact-link web"
+                            title={lead.website}
                           >
-                            <Globe size={13} />
-                            <span>{lead.website.replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '')}</span>
-                            <ExternalLink size={11} className="ext-icon" />
+                            <Globe size={13} className="shrink-0" />
+                            <span className="truncate-link">{formatDisplayUrl(lead.website)}</span>
+                            <ExternalLink size={11} className="ext-icon shrink-0" />
                           </a>
                         ) : (
                           <div className="unlisted-wrapper">
@@ -762,7 +836,7 @@ function App() {
                               className="lookup-link"
                               title="Search official website on Google"
                             >
-                              <Search size={11} />
+                              <Search size={11} className="shrink-0" />
                               <span>Search Site</span>
                             </a>
                           </div>
@@ -771,7 +845,7 @@ function App() {
                     </td>
                     <td className="address-cell">
                       <div className="address-content">
-                        <MapPin size={13} className="pin-icon" />
+                        <MapPin size={13} className="pin-icon shrink-0" />
                         <span title={lead.address}>{lead.address}</span>
                       </div>
                     </td>
@@ -786,7 +860,7 @@ function App() {
                             <span className="review-count">({lead.reviews})</span>
                           </>
                         ) : (
-                          <span className="unlisted-text">No public rating</span>
+                          <span className="unlisted-text">No rating</span>
                         )}
                       </div>
                     </td>
@@ -799,9 +873,9 @@ function App() {
                           className="btn-gmaps-verify"
                           title="Open and cross-verify this exact place on Google Maps"
                         >
-                          <MapPin size={13} className="gmaps-icon" />
-                          <span>Google Maps</span>
-                          <ExternalLink size={11} />
+                          <MapPin size={12} className="gmaps-icon shrink-0" />
+                          <span>Maps</span>
+                          <ExternalLink size={10} className="shrink-0" />
                         </a>
                         <button
                           type="button"
@@ -824,9 +898,25 @@ function App() {
 
             {displayedLeads.length === 0 && (
               <div className="empty-state">
-                <Search size={36} className="empty-icon" />
-                <h3>No leads match this view filter</h3>
-                <p>Switch the display filter above to "All Found Leads" or adjust your targeting.</p>
+                {!hasSearched ? (
+                  <>
+                    <Compass size={42} className="empty-icon text-indigo" />
+                    <h3>Ready to Discover Leads</h3>
+                    <p>Select your Target Country and Industry above, then click <strong>Find Real Leads</strong>.</p>
+                  </>
+                ) : leads.length === 0 ? (
+                  <>
+                    <Search size={36} className="empty-icon" />
+                    <h3>No verified leads found</h3>
+                    <p>No listings matched for this specific area or category. Try choosing a different city or broadening the category.</p>
+                  </>
+                ) : (
+                  <>
+                    <Search size={36} className="empty-icon" />
+                    <h3>No leads match this view filter</h3>
+                    <p>Switch the display filter above to "All Found Leads" or adjust your targeting.</p>
+                  </>
+                )}
               </div>
             )}
           </div>
